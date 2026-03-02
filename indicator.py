@@ -22,6 +22,9 @@ except ImportError:
     sys.exit(0)
 
 
+_REC_COLOR = "#dc2626"
+
+
 def main():
     root = tk.Tk()
     root.title("")
@@ -33,16 +36,16 @@ def main():
     except tk.TclError:
         pass
 
-    root.configure(bg="#dc2626")
+    root.configure(bg=_REC_COLOR)
 
-    frame = tk.Frame(root, bg="#dc2626", padx=12, pady=6)
+    frame = tk.Frame(root, bg=_REC_COLOR, padx=12, pady=6)
     frame.pack()
 
     tk.Label(
         frame,
         text="\u25cf REC",
         fg="white",
-        bg="#dc2626",
+        bg=_REC_COLOR,
         font=("Ubuntu", 11, "bold"),
     ).pack()
 

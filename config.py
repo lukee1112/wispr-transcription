@@ -20,9 +20,7 @@ SAMPLE_RATE = 16000  # 16kHz mono, optimal for Whisper
 CHANNELS = 1
 MIN_RECORDING_SECONDS = 0.5
 MAX_RECORDING_SECONDS = 300  # 5 minutes
-
-# Output settings
-TYPING_DELAY_MS = 8  # ms between keystrokes for xdotool (fallback only)
+SILENCE_RMS_THRESHOLD = 0.001  # Below this RMS, audio is treated as silence
 
 # Filler words - always removed
 FILLER_WORDS = [

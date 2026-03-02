@@ -12,6 +12,27 @@ from config import WHISPER_MODEL, WHISPER_LANGUAGE, FILLER_WORDS, CONTEXT_FILLER
 
 logger = logging.getLogger(__name__)
 
+# Pre-compiled regex patterns for filler removal (static, built once)
+_FILLER_PATTERNS = [
+    re.compile(r',?\s*\b' + re.escape(f) + r'\b\s*,?', re.IGNORECASE)
+    for f in FILLER_WORDS
+]
+
+_CONTEXT_PATTERNS = []
+for _f in CONTEXT_FILLERS:
+    _e = re.escape(_f)
+    _CONTEXT_PATTERNS.append((
+        re.compile(r',\s*\b' + _e + r'\b\s*,', re.IGNORECASE),
+        re.compile(r'(?:^|(?<=\.\s))' + _e + r',?\s*', re.IGNORECASE),
+        re.compile(r',?\s*\b' + _e + r'\b\s*(?=[.!?])', re.IGNORECASE),
+    ))
+
+_RE_MULTI_SPACE = re.compile(r'\s{2,}')
+_RE_SPACE_BEFORE_PUNCT = re.compile(r'\s+([.,!?;:])')
+_RE_DOUBLE_COMMA = re.compile(r',\s*,')
+_RE_LEADING_COMMA = re.compile(r'^\s*,\s*')
+_RE_TRAILING_COMMA = re.compile(r',\s*$')
+
 
 class Transcriber:
     def __init__(self):
@@ -62,16 +83,11 @@ class Transcriber:
     def clean_text(self, text: str) -> str:
         """Remove filler words and clean punctuation."""
         # Remove always-filler words (um, uh, etc.)
-        # Remove always-filler words (um, uh, etc.)
-        for filler in FILLER_WORDS:
-            pattern = re.compile(
-                r',?\s*\b' + re.escape(filler) + r'\b\s*,?',
-                re.IGNORECASE,
-            )
+        for pattern in _FILLER_PATTERNS:
 
-            def _replace(m, _text=text):
+            def _replace(m):
                 # Preserve filler if preceded by a digit (measurement: "100 mm")
-                before = _text[:m.start()].rstrip(' ,')
+                before = m.string[:m.start()].rstrip(' ,')
                 if before and before[-1].isdigit():
                     return m.group(0)
                 return ' '
@@ -79,30 +95,17 @@ class Transcriber:
             text = pattern.sub(_replace, text)
 
         # Remove context-dependent fillers only in filler positions
-        for filler in CONTEXT_FILLERS:
-            escaped = re.escape(filler)
-            # Between commas: ", like, "
-            text = re.sub(
-                r',\s*\b' + escaped + r'\b\s*,', ',',
-                text, flags=re.IGNORECASE,
-            )
-            # At sentence start: "Like, ..."
-            text = re.sub(
-                r'(?:^|(?<=\.\s))' + escaped + r',?\s*',
-                '', text, flags=re.IGNORECASE,
-            )
-            # Before sentence end: "... like."
-            text = re.sub(
-                r',?\s*\b' + escaped + r'\b\s*(?=[.!?])',
-                '', text, flags=re.IGNORECASE,
-            )
+        for between_commas, at_start, before_end in _CONTEXT_PATTERNS:
+            text = between_commas.sub(',', text)
+            text = at_start.sub('', text)
+            text = before_end.sub('', text)
 
         # Clean up whitespace and punctuation artifacts
-        text = re.sub(r'\s{2,}', ' ', text)
-        text = re.sub(r'\s+([.,!?;:])', r'\1', text)
-        text = re.sub(r',\s*,', ',', text)
-        text = re.sub(r'^\s*,\s*', '', text)
-        text = re.sub(r',\s*$', '.', text)
+        text = _RE_MULTI_SPACE.sub(' ', text)
+        text = _RE_SPACE_BEFORE_PUNCT.sub(r'\1', text)
+        text = _RE_DOUBLE_COMMA.sub(',', text)
+        text = _RE_LEADING_COMMA.sub('', text)
+        text = _RE_TRAILING_COMMA.sub('.', text)
 
         text = text.strip()
 

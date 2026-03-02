@@ -5,8 +5,8 @@ Hold a hotkey to record, release to transcribe and type into the focused window.
 Uses X11 key grabs (works on XWayland/WSLg) instead of XRecord.
 """
 import os
-import re
 import sys
+import select
 import signal
 import subprocess
 import threading
@@ -22,6 +22,7 @@ from Xlib import display, X, XK
 from config import (
     HOTKEY, SAMPLE_RATE, CHANNELS,
     MIN_RECORDING_SECONDS, MAX_RECORDING_SECONDS,
+    SILENCE_RMS_THRESHOLD,
     DATA_DIR, LOG_FILE, PID_FILE, INSTALL_DIR,
 )
 from transcriber import Transcriber
@@ -72,12 +73,11 @@ class WisprDaemon:
             self.notify("No microphone found", urgency="critical")
             return False
 
-    def check_display(self) -> bool:
+    def check_display(self):
         display_env = os.environ.get("DISPLAY")
         if not display_env:
             logger.warning("DISPLAY not set, trying :0")
             os.environ["DISPLAY"] = ":0"
-        return True
 
     # ── Notifications ──────────────────────────────────────────
 
@@ -122,6 +122,17 @@ class WisprDaemon:
                 pass
             self.indicator_proc = None
 
+    # ── Audio stream ──────────────────────────────────────────
+
+    def _close_stream(self):
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+
     # ── Audio recording ────────────────────────────────────────
 
     def start_recording(self):
@@ -161,15 +172,7 @@ class WisprDaemon:
             self.recording = False
             self.processing = True
 
-        # Stop audio stream BEFORE reading audio_frames
-        if self.stream:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception:
-                pass
-            self.stream = None
-
+        self._close_stream()
         self.hide_indicator()
 
         try:
@@ -178,7 +181,8 @@ class WisprDaemon:
                 self.notify("No audio captured")
                 return
 
-            audio = np.concatenate(self.audio_frames, axis=0).flatten()
+            audio = np.concatenate(self.audio_frames, axis=0)[:, 0]
+            self.audio_frames = []
             duration = len(audio) / SAMPLE_RATE
             logger.info(f"Recording duration: {duration:.1f}s")
 
@@ -192,8 +196,8 @@ class WisprDaemon:
                 audio = audio[: int(MAX_RECORDING_SECONDS * SAMPLE_RATE)]
 
             # Check for silence
-            rms = np.sqrt(np.mean(audio ** 2))
-            if rms < 0.001:
+            rms = np.sqrt(np.dot(audio, audio) / len(audio))
+            if rms < SILENCE_RMS_THRESHOLD:
                 logger.info(f"Audio too quiet (RMS={rms:.6f}), likely silence")
                 self.notify("No speech detected")
                 return
@@ -201,7 +205,7 @@ class WisprDaemon:
             self.notify("Transcribing...")
             text = self.transcriber.transcribe(audio)
 
-            if not text or re.fullmatch(r'[.\s]*', text):
+            if not text or not text.strip('. \t\n'):
                 logger.info("No speech detected in transcription output")
                 self.notify("No speech detected")
                 return
@@ -213,6 +217,7 @@ class WisprDaemon:
             logger.error(f"Transcription failed: {e}", exc_info=True)
             self.notify(f"Transcription error: {e}", urgency="critical")
         finally:
+            self.audio_frames = []
             with self.lock:
                 self.processing = False
 
@@ -291,7 +296,6 @@ class WisprDaemon:
         logger.info("X11 key grab active")
 
         try:
-            import select
             fd = d.fileno()
 
             while not self._shutdown:
@@ -304,34 +308,29 @@ class WisprDaemon:
                     event = d.next_event()
 
                     if event.type == X.KeyPress:
-                        # Filter auto-repeat: if next event is KeyRelease
-                        # for the same key followed by KeyPress, it's repeat
+                        # Filter auto-repeat: X11 sends KeyRelease+KeyPress
+                        # pairs for held keys. Peek ahead to detect this.
                         if d.pending_events() > 0:
                             next_ev = d.next_event()
                             if (next_ev.type == X.KeyRelease
                                     and next_ev.detail == keycode):
-                                # Auto-repeat release, skip
+                                # This KeyPress follows a release — auto-repeat.
+                                # Discard both and continue holding.
                                 continue
-                            # Not repeat — process the peeked event
-                            if next_ev.type == X.KeyRelease and next_ev.detail == keycode:
-                                self._on_key_release()
-                            elif next_ev.type == X.KeyPress and next_ev.detail == keycode:
-                                pass  # Already recording
+                            # Not auto-repeat. Process the peeked event.
+                            self._handle_event(next_ev, keycode)
                         self._on_key_press()
 
                     elif event.type == X.KeyRelease:
-                        # Check for auto-repeat: peek next event
+                        # Filter auto-repeat: peek for immediate KeyPress
                         if d.pending_events() > 0:
                             next_ev = d.next_event()
                             if (next_ev.type == X.KeyPress
                                     and next_ev.detail == keycode):
-                                # Auto-repeat, ignore both events
+                                # Auto-repeat pair, ignore both
                                 continue
-                            # Not repeat — put back by processing it
-                            if next_ev.type == X.KeyPress and next_ev.detail == keycode:
-                                self._on_key_press()
-                            elif next_ev.type == X.KeyRelease and next_ev.detail == keycode:
-                                self._on_key_release()
+                            # Real release + unrelated event. Process both.
+                            self._handle_event(next_ev, keycode)
                         self._on_key_release()
 
         finally:
@@ -341,6 +340,13 @@ class WisprDaemon:
             except Exception:
                 pass
             d.close()
+
+    def _handle_event(self, event, keycode):
+        """Process a peeked event that wasn't part of auto-repeat."""
+        if event.type == X.KeyPress and event.detail == keycode:
+            self._on_key_press()
+        elif event.type == X.KeyRelease and event.detail == keycode:
+            self._on_key_release()
 
     def _on_key_press(self):
         self.start_recording()
@@ -393,12 +399,7 @@ class WisprDaemon:
             self._active_thread.join(timeout=30)
 
         self.hide_indicator()
-        if self.stream:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception:
-                pass
+        self._close_stream()
         logger.info("Shutdown complete")
 
 
