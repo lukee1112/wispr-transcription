@@ -41,7 +41,7 @@ echo -e "${YELLOW}[1/5]${NC} Installing system dependencies..."
 sudo apt-get update -qq
 sudo apt-get install -y -qq \
     python3 python3-pip python3-venv python3-dev python3-tk \
-    portaudio19-dev \
+    portaudio19-dev libasound2-plugins \
     ffmpeg \
     xdotool \
     xclip \
