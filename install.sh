@@ -37,7 +37,7 @@ fi
 echo ""
 
 # ── System dependencies ───────────────────────────────────────
-echo -e "${YELLOW}[1/5]${NC} Installing system dependencies..."
+echo -e "${YELLOW}[1/6]${NC} Installing system dependencies..."
 sudo apt-get update -qq
 sudo apt-get install -y -qq \
     python3 python3-pip python3-venv python3-dev python3-tk \
@@ -50,24 +50,40 @@ sudo apt-get install -y -qq \
 echo -e "  ${GREEN}done${NC}"
 
 # ── Python virtual environment ─────────────────────────────────
-echo -e "${YELLOW}[2/5]${NC} Creating Python virtual environment..."
+echo -e "${YELLOW}[2/6]${NC} Creating Python virtual environment..."
 python3 -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip -q
 echo -e "  ${GREEN}done${NC}"
 
 # ── Python packages ────────────────────────────────────────────
-echo -e "${YELLOW}[3/5]${NC} Installing Python dependencies..."
+echo -e "${YELLOW}[3/6]${NC} Installing Python dependencies..."
 pip install -q -r "$INSTALL_DIR/requirements.txt"
 echo -e "  ${GREEN}done${NC}"
 
 # ── Download Whisper model ─────────────────────────────────────
-echo -e "${YELLOW}[4/5]${NC} Downloading Whisper medium model (~1.5 GB)..."
+echo -e "${YELLOW}[4/6]${NC} Downloading Whisper medium model (~1.5 GB)..."
 python3 -c "import whisper; whisper.load_model('medium')"
 echo -e "  ${GREEN}done${NC}"
 
+# ── Compile keyboard hook ─────────────────────────────────────
+echo -e "${YELLOW}[5/6]${NC} Compiling keyboard hook..."
+WIN_CS=$(wslpath -w "$INSTALL_DIR/keyhook.cs" 2>/dev/null)
+WIN_EXE=$(wslpath -w "$INSTALL_DIR/keyhook.exe" 2>/dev/null)
+if [ -n "$WIN_CS" ]; then
+    if powershell.exe -NoProfile -Command \
+        "& 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe' /nologo /target:exe /reference:System.Windows.Forms.dll '/out:$WIN_EXE' '$WIN_CS'" 2>/dev/null; then
+        echo -e "  ${GREEN}done${NC}"
+    else
+        echo -e "  ${RED}FAILED: Could not compile keyhook.cs${NC}"
+        echo "  Keyboard capture will not work without this."
+    fi
+else
+    echo -e "  ${RED}FAILED: wslpath not available${NC}"
+fi
+
 # ── Autostart & scripts ───────────────────────────────────────
-echo -e "${YELLOW}[5/5]${NC} Setting up autostart and scripts..."
+echo -e "${YELLOW}[6/6]${NC} Setting up autostart and scripts..."
 chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/stop.sh" "$INSTALL_DIR/wispr.py"
 mkdir -p "$DATA_DIR" "$AUTOSTART_DIR"
 
@@ -86,27 +102,19 @@ EOF
 
 echo -e "  ${GREEN}done${NC}"
 
-# ── Verify X11 key grab ──────────────────────────────────────
+# ── Verify keyboard hook ─────────────────────────────────────
 echo ""
 echo -e "${YELLOW}Verifying keyboard capture...${NC}"
-if python3 -c "
-from Xlib import display, X, XK
-d = display.Display()
-root = d.screen().root
-keycode = d.keysym_to_keycode(XK.XK_Alt_R)
-root.grab_key(keycode, X.AnyModifier, True, X.GrabModeAsync, X.GrabModeAsync)
-d.sync()
-root.ungrab_key(keycode, X.AnyModifier)
-d.sync()
-d.close()
-" 2>/dev/null; then
-    echo -e "  ${GREEN}X11 key grab works!${NC}"
+if [ -f "$INSTALL_DIR/keyhook.exe" ]; then
+    echo -e "  ${GREEN}keyhook.exe compiled successfully${NC}"
 else
-    echo -e "  ${RED}WARNING: X11 key grab failed.${NC}"
-    echo "  Make sure DISPLAY is set and an X server is running."
-    if [ "$IS_WSL" = true ]; then
-        echo "  WSL requires WSLg (Windows 11) for X11 support."
-    fi
+    echo -e "  ${RED}WARNING: keyhook.exe not found.${NC}"
+    echo "  Keyboard capture will not work. Check .NET Framework installation."
+fi
+if command -v schtasks.exe &>/dev/null; then
+    echo -e "  ${GREEN}schtasks.exe available (process launcher)${NC}"
+else
+    echo -e "  ${RED}WARNING: schtasks.exe not found.${NC}"
 fi
 
 # ── Summary ────────────────────────────────────────────────────

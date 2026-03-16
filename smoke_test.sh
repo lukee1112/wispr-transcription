@@ -39,7 +39,7 @@ echo ""
 
 # ── 2. Python dependencies ───────────────────────────────────
 echo "2. Python imports"
-for mod in "numpy" "sounddevice" "whisper" "torch" "Xlib"; do
+for mod in "numpy" "sounddevice" "whisper" "torch"; do
     if python3 -c "import $mod" 2>/dev/null; then
         pass "$mod"
     else
@@ -50,7 +50,7 @@ echo ""
 
 # ── 3. System tools ──────────────────────────────────────────
 echo "3. System tools"
-for tool in xdotool xclip notify-send ffmpeg; do
+for tool in ffmpeg; do
     if command -v "$tool" &>/dev/null; then
         pass "$tool"
     else
@@ -59,18 +59,37 @@ for tool in xdotool xclip notify-send ffmpeg; do
 done
 echo ""
 
-# ── 4. Display ───────────────────────────────────────────────
-echo "4. Display"
-if [ -n "${DISPLAY:-}" ]; then
-    pass "DISPLAY=$DISPLAY"
+# ── 4. Windows interop ──────────────────────────────────────
+echo "4. Windows interop"
+if command -v powershell.exe &>/dev/null; then
+    pass "powershell.exe (keyboard hook)"
 else
-    fail "DISPLAY not set"
+    fail "powershell.exe not found"
+fi
+if command -v clip.exe &>/dev/null; then
+    pass "clip.exe (clipboard)"
+else
+    fail "clip.exe not found"
+fi
+if command -v wslpath &>/dev/null; then
+    pass "wslpath (path conversion)"
+else
+    fail "wslpath not found"
 fi
 echo ""
 
-# ── 5. Audio input ───────────────────────────────────────────
-echo "5. Audio input (microphone)"
-MIC_RESULT=$(python3 -c "
+# ── 5. Display ───────────────────────────────────────────────
+echo "5. Display"
+if [ -n "${DISPLAY:-}" ]; then
+    pass "DISPLAY=$DISPLAY"
+else
+    warn "DISPLAY not set (indicator overlay may not work)"
+fi
+echo ""
+
+# ── 6. Audio input ───────────────────────────────────────────
+echo "6. Audio input (microphone)"
+MIC_RESULT=$(PULSE_SERVER="${PULSE_SERVER:-unix:/mnt/wslg/PulseServer}" python3 -c "
 import sounddevice as sd
 try:
     dev = sd.query_devices(kind='input')
@@ -85,64 +104,40 @@ else
 fi
 echo ""
 
-# ── 6. X11 key grab ──────────────────────────────────────────
-echo "6. X11 key grab (hotkey capture)"
-GRAB_RESULT=$(python3 -c "
-from Xlib import display, X, XK
-try:
-    d = display.Display()
-    root = d.screen().root
-    keycode = d.keysym_to_keycode(XK.XK_Alt_R)
-    root.grab_key(keycode, X.AnyModifier, True, X.GrabModeAsync, X.GrabModeAsync)
-    d.sync()
-    root.ungrab_key(keycode, X.AnyModifier)
-    d.sync()
-    d.close()
-    print('OK')
-except Exception as e:
-    print('FAIL:' + str(e))
-" 2>&1)
-if [ "$GRAB_RESULT" = "OK" ]; then
-    pass "XGrabKey works on this display"
-else
-    fail "XGrabKey failed: ${GRAB_RESULT#FAIL:}"
-fi
-echo ""
-
-# ── 7. Clipboard ─────────────────────────────────────────────
-echo "7. Clipboard"
+# ── 7. Clipboard round-trip ──────────────────────────────────
+echo "7. Clipboard (Windows)"
 TEST_STR="wispr-smoke-test-$$"
-if echo -n "$TEST_STR" | xclip -selection clipboard 2>/dev/null; then
-    CLIP=$(xclip -selection clipboard -o 2>/dev/null)
-    if [ "$CLIP" = "$TEST_STR" ]; then
-        pass "Clipboard round-trip OK"
-    else
-        fail "Clipboard wrote but read back wrong value"
-    fi
+if echo -n "$TEST_STR" | clip.exe 2>/dev/null; then
+    pass "clip.exe write OK"
 else
-    fail "Could not write to clipboard"
+    fail "clip.exe write failed"
 fi
 echo ""
 
-# ── 8. xdotool ──────────────────────────────────────────────
-echo "8. xdotool"
-if xdotool getactivewindow &>/dev/null; then
-    pass "xdotool can detect active window"
+# ── 8. Keyboard hook ─────────────────────────────────────────
+echo "8. Keyboard hook"
+if [ -f "$INSTALL_DIR/keyhook.exe" ]; then
+    pass "keyhook.exe compiled"
 else
-    warn "xdotool getactivewindow failed (may work differently on WSLg)"
+    fail "keyhook.exe not found — run ./install.sh"
+fi
+if command -v schtasks.exe &>/dev/null; then
+    pass "schtasks.exe (process launcher)"
+else
+    fail "schtasks.exe not found"
 fi
 echo ""
 
 # ── 9. Indicator ─────────────────────────────────────────────
 echo "9. Recording indicator"
 IND_PID=$(python3 "$INSTALL_DIR/indicator.py" &>/dev/null & echo $!)
-sleep 0.5
+sleep 1
 if kill -0 "$IND_PID" 2>/dev/null; then
     kill "$IND_PID" 2>/dev/null
     wait "$IND_PID" 2>/dev/null
     pass "Indicator launches and terminates"
 else
-    fail "Indicator process died immediately"
+    warn "Indicator process exited (display may not be available)"
 fi
 echo ""
 
@@ -160,15 +155,6 @@ if [ "$MODEL_RESULT" = "OK" ]; then
     pass "Whisper medium model cached at ~/.cache/whisper/"
 else
     warn "Model not cached yet (will download on first start)"
-fi
-echo ""
-
-# ── 11. Notify ───────────────────────────────────────────────
-echo "11. Desktop notifications"
-if notify-send "Wispr Smoke Test" "If you see this, notifications work!" --urgency low 2>/dev/null; then
-    pass "notify-send works (you should see a notification)"
-else
-    warn "notify-send failed (notifications are optional)"
 fi
 echo ""
 

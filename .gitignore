@@ -7,3 +7,11 @@ dist/
 build/
 *.log
 .env
+keyhook.exe
+_keyhook_launcher.vbs
+_keytest*
+_diag*
+_hooktest*
+_fulltest*
+_session_diag*
+_keyhook.cs

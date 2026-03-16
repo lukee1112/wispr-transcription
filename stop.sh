@@ -22,3 +22,6 @@ else
         echo "Wispr Transcription is not running"
     fi
 fi
+
+# Clean up the Windows scheduled task and keyboard hook process
+schtasks.exe /Delete /TN "WisprKeyHook" /F 2>/dev/null || true

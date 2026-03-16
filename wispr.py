@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Wispr Transcription - Local voice dictation daemon.
 
-Hold a hotkey to record, release to transcribe and type into the focused window.
-Uses X11 key grabs (works on XWayland/WSLg) instead of XRecord.
+Hold a hotkey to record, release to transcribe and paste into the focused window.
+Uses a Windows-side keyboard hook (PowerShell) for key capture on WSL2.
 """
 import os
 import sys
-import select
+import shutil
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -15,12 +16,13 @@ import logging
 import atexit
 from logging.handlers import RotatingFileHandler
 
+from pathlib import Path
+
 import numpy as np
 import sounddevice as sd
-from Xlib import display, X, XK
 
 from config import (
-    HOTKEY, SAMPLE_RATE, CHANNELS,
+    HOTKEY, VK_CODES, SAMPLE_RATE, CHANNELS,
     MIN_RECORDING_SECONDS, MAX_RECORDING_SECONDS,
     SILENCE_RMS_THRESHOLD,
     DATA_DIR, LOG_FILE, PID_FILE, INSTALL_DIR,
@@ -39,8 +41,13 @@ class WisprDaemon:
         self.stream = None
         self.indicator_proc = None
         self.lock = threading.Lock()
+        self._hook_lock = threading.Lock()  # serialises writes to _hook_conn
         self._shutdown = False
         self._active_thread = None
+        self._hook_proc = None
+        self._hook_conn = None
+        self._server_sock = None
+        self._key_held = False
 
     # ── Lifecycle ──────────────────────────────────────────────
 
@@ -78,6 +85,39 @@ class WisprDaemon:
         if not display_env:
             logger.warning("DISPLAY not set, trying :0")
             os.environ["DISPLAY"] = ":0"
+
+    # ── Audio feedback ─────────────────────────────────────────
+
+    def _play_sound(self, win_path: str):
+        """Play a Windows WAV file non-blocking via PowerShell SoundPlayer."""
+        try:
+            subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-Command",
+                 f"(New-Object Media.SoundPlayer '{win_path}').PlaySync()"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    def _beep(self, freq=660, duration=120):
+        """Non-blocking beep via Windows PowerShell. Works regardless of focus."""
+        try:
+            subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-Command",
+                 f"[Console]::Beep({freq},{duration})"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    def _send_hook_cmd(self, cmd: str):
+        """Send a control command to keyhook.exe over the existing TCP connection."""
+        with self._hook_lock:
+            if self._hook_conn:
+                try:
+                    self._hook_conn.sendall((cmd + "\n").encode())
+                except Exception as e:
+                    logger.warning(f"Hook command {cmd!r} failed: {e}")
 
     # ── Notifications ──────────────────────────────────────────
 
@@ -143,6 +183,8 @@ class WisprDaemon:
             self.audio_frames = []
 
         try:
+            self._play_sound("C:\\Windows\\Media\\Windows Notify.wav")
+            self.notify("Recording...")
             self.stream = sd.InputStream(
                 samplerate=SAMPLE_RATE,
                 channels=CHANNELS,
@@ -152,6 +194,7 @@ class WisprDaemon:
             )
             self.stream.start()
             self.show_indicator()
+            self._send_hook_cmd("RECORD_START")
             logger.info("Recording started")
         except Exception as e:
             logger.error(f"Failed to start recording: {e}")
@@ -174,6 +217,7 @@ class WisprDaemon:
 
         self._close_stream()
         self.hide_indicator()
+        self._send_hook_cmd("RECORD_STOP")
 
         try:
             if not self.audio_frames:
@@ -223,141 +267,216 @@ class WisprDaemon:
 
     # ── Text output ────────────────────────────────────────────
 
-    def _copy_to_clipboard(self, text):
-        """Copy text to X11 clipboard. Returns True on success."""
-        for cmd in [
-            ["xclip", "-selection", "clipboard"],
-            ["xsel", "--clipboard", "--input"],
-        ]:
-            try:
-                subprocess.run(
-                    cmd, input=text.encode("utf-8"),
-                    check=True, timeout=5,
-                )
-                logger.info(f"Copied to clipboard ({cmd[0]})")
-                return True
-            except FileNotFoundError:
-                continue
-            except Exception as e:
-                logger.error(f"Clipboard copy failed ({cmd[0]}): {e}")
-                continue
-        logger.error("No clipboard tool available")
-        return False
-
     def output_text(self, text):
         """Copy text to clipboard and paste into focused window."""
-        if not self._copy_to_clipboard(text):
-            return
-
-        # Small delay so the released hotkey doesn't interfere
-        time.sleep(0.15)
-
-        # Paste via Ctrl+V (handles Unicode correctly, unlike xdotool type)
+        # Copy to Windows clipboard via clip.exe
         try:
             subprocess.run(
-                ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                ["clip.exe"],
+                input=text.encode("utf-16-le"),
                 check=True,
                 timeout=5,
             )
-            logger.info("Pasted into focused window")
-        except FileNotFoundError:
-            logger.error("xdotool not found — text is in your clipboard")
-            self.notify("xdotool not found — text copied to clipboard only",
-                        urgency="critical")
+            logger.info("Copied to Windows clipboard")
         except Exception as e:
-            logger.error(f"xdotool paste failed: {e}")
-            self.notify("Paste failed — text is in your clipboard")
+            logger.error(f"Clipboard copy failed: {e}")
+            return
 
-    # ── X11 keyboard listener ─────────────────────────────────
+        # Beep signals paste is incoming; brief delay so user can focus target window
+        self._beep(440, 200)   # low beep = paste incoming
+        time.sleep(0.3)
+
+        # Paste via keyhook.exe keybd_event (works in all apps including Windows Terminal).
+        # Falls back to PowerShell SendKeys if the hook isn't connected.
+        if self._hook_conn:
+            self._send_hook_cmd("PASTE")
+            logger.info("Pasted via keyboard hook")
+        else:
+            try:
+                subprocess.run(
+                    [
+                        "powershell.exe", "-NoProfile", "-Command",
+                        "Add-Type -AssemblyName System.Windows.Forms;"
+                        "[System.Windows.Forms.SendKeys]::SendWait('^v')",
+                    ],
+                    timeout=5,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                logger.info("Pasted via PowerShell (fallback)")
+            except Exception as e:
+                logger.error(f"Paste failed: {e}")
+                self.notify("Paste failed — text is in your clipboard")
+
+    # ── Windows keyboard hook ─────────────────────────────────
+
+    def _get_wsl_ip(self) -> str:
+        """Return the WSL2 VM's IP address as reachable from Windows in NAT mode.
+
+        In NAT mode, Windows can connect to WSL2 using the VM's eth0 IP.
+        Detected by opening a dummy UDP socket and reading the outbound address.
+        Falls back to 127.0.0.1 which works in mirrored networking mode.
+        """
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                return s.getsockname()[0]
+        except Exception:
+            return "127.0.0.1"
 
     def _run_keyboard_listener(self):
-        """Listen for hotkey using X11 key grabs (works on XWayland/WSLg)."""
-        d = display.Display()
-        root = d.screen().root
+        """Capture hotkey via compiled C# keyboard hook over TCP.
 
-        keysym = XK.string_to_keysym(HOTKEY)
-        if keysym == 0:
-            logger.error(f"Unknown hotkey keysym: '{HOTKEY}'")
+        Architecture: Python starts a TCP server, then launches keyhook.exe
+        via powershell.exe Start-Process. This runs keyhook.exe in the user's
+        interactive session (Session 1), which is required for WH_KEYBOARD_LL
+        to receive keyboard events. The IP of this WSL2 VM is passed so
+        keyhook.exe can connect back in NAT networking mode.
+        """
+        vk_code = VK_CODES.get(HOTKEY)
+        if vk_code is None:
+            logger.error(f"Unknown hotkey: '{HOTKEY}' — "
+                         f"valid options: {', '.join(VK_CODES.keys())}")
             self.notify(f"Unknown hotkey: {HOTKEY}", urgency="critical")
             return
 
-        keycode = d.keysym_to_keycode(keysym)
-        if keycode == 0:
-            logger.error(f"Could not map keysym to keycode: '{HOTKEY}'")
-            self.notify(f"Could not map hotkey: {HOTKEY}", urgency="critical")
+        # Find the compiled hook executable
+        exe_path = INSTALL_DIR / "keyhook.exe"
+        if not exe_path.exists():
+            logger.error("keyhook.exe not found — run ./install.sh first")
+            self.notify("keyhook.exe not found — reinstall required",
+                        urgency="critical")
             return
 
-        logger.info(f"Hotkey: {HOTKEY} (keycode={keycode})")
-
-        # Grab the key globally — works on XWayland unlike XRecord
-        root.grab_key(keycode, X.AnyModifier, True,
-                      X.GrabModeAsync, X.GrabModeAsync)
-        d.sync()
-        logger.info("X11 key grab active")
-
+        # Copy to Windows temp to avoid UNC path trust restrictions.
+        # Executables on \\wsl.localhost\ are treated as "network zone" by
+        # Windows and may lose UIPI clearance needed for keyboard hooks.
         try:
-            fd = d.fileno()
+            win_temp = subprocess.check_output(
+                ["powershell.exe", "-NoProfile", "-Command",
+                 "[System.IO.Path]::GetTempPath()"],
+                text=True, timeout=10,
+            ).strip().rstrip("\\")
+            wsl_temp = subprocess.check_output(
+                ["wslpath", "-u", win_temp], text=True,
+            ).strip()
+            dest = Path(wsl_temp) / "wispr_keyhook.exe"
+            shutil.copy2(exe_path, dest)
+            win_exe_path = subprocess.check_output(
+                ["wslpath", "-w", str(dest)], text=True,
+            ).strip()
+            logger.info(f"Copied keyhook.exe to {win_exe_path}")
+        except Exception as e:
+            logger.error(f"Could not copy keyhook.exe to Windows temp: {e}")
+            return
 
-            while not self._shutdown:
-                readable, _, _ = select.select([fd], [], [], 0.25)
-                if not readable:
-                    continue
+        # Get WSL2's IP so keyhook.exe can connect back in NAT networking mode
+        wsl_ip = self._get_wsl_ip()
+        logger.info(f"WSL2 IP for hook callback: {wsl_ip}")
 
-                n = d.pending_events()
-                for _ in range(n):
-                    event = d.next_event()
+        # Start TCP server for hook communication
+        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server_sock.bind(('0.0.0.0', 0))
+        self._server_sock.listen(1)
+        port = self._server_sock.getsockname()[1]
+        self._server_sock.settimeout(30)
+        logger.info(f"Keyboard hook TCP server listening on port {port}")
 
-                    if event.type == X.KeyPress:
-                        # Filter auto-repeat: X11 sends KeyRelease+KeyPress
-                        # pairs for held keys. Peek ahead to detect this.
-                        if d.pending_events() > 0:
-                            next_ev = d.next_event()
-                            if (next_ev.type == X.KeyRelease
-                                    and next_ev.detail == keycode):
-                                # This KeyPress follows a release — auto-repeat.
-                                # Discard both and continue holding.
-                                continue
-                            # Not auto-repeat. Process the peeked event.
-                            self._handle_event(next_ev, keycode)
-                        self._on_key_press()
+        # Launch keyhook.exe via PowerShell Start-Process. This runs the exe
+        # in the user's interactive session (Session 1), which is required for
+        # WH_KEYBOARD_LL to receive keyboard events. schtasks /Run would put
+        # it in Session 0 (service session) where the hook gets no input.
+        logger.info(f"Launching keyboard hook for {HOTKEY} "
+                    f"(VK=0x{vk_code:02X}) via Start-Process")
+        ps_cmd = (
+            f'Start-Process -FilePath "{win_exe_path}" '
+            f'-ArgumentList "{wsl_ip} {port} {vk_code}" '
+            f'-WindowStyle Hidden'
+        )
+        try:
+            subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive",
+                 "-Command", ps_cmd],
+                capture_output=True, timeout=15,
+            )
+        except Exception as e:
+            logger.error(f"Failed to launch keyboard hook: {e}")
+            self.notify("Keyboard hook launch failed — see logs",
+                        urgency="critical")
+            self._server_sock.close()
+            return
 
-                    elif event.type == X.KeyRelease:
-                        # Filter auto-repeat: peek for immediate KeyPress
-                        if d.pending_events() > 0:
-                            next_ev = d.next_event()
-                            if (next_ev.type == X.KeyPress
-                                    and next_ev.detail == keycode):
-                                # Auto-repeat pair, ignore both
-                                continue
-                            # Real release + unrelated event. Process both.
-                            self._handle_event(next_ev, keycode)
-                        self._on_key_release()
-
+        # Wait for the hook process to connect
+        try:
+            self._hook_conn, addr = self._server_sock.accept()
+            logger.info(f"Keyboard hook connected from {addr}")
+        except socket.timeout:
+            logger.error("Keyboard hook did not connect within 30s")
+            self.notify("Keyboard hook timeout — see logs", urgency="critical")
+            self._server_sock.close()
+            return
         finally:
+            self._server_sock.close()
+            self._server_sock = None
+
+        # Read events from TCP connection
+        try:
+            reader = self._hook_conn.makefile('r')
+            first_line = reader.readline().strip()
+            if first_line == "HOOK_FAILED":
+                logger.error("Keyboard hook failed to install")
+                self.notify("Keyboard hook failed — see logs",
+                            urgency="critical")
+                return
+            if first_line != "HOOK_READY":
+                logger.error(f"Unexpected hook response: '{first_line}'")
+                self.notify("Keyboard hook error — see logs",
+                            urgency="critical")
+                return
+
+            logger.info("Windows keyboard hook active")
+
+            for line in reader:
+                if self._shutdown:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                if line == "KEY_DOWN":
+                    if not self._key_held:
+                        self._key_held = True
+                        self.start_recording()
+                elif line == "KEY_UP":
+                    if self._key_held:
+                        self._key_held = False
+                        t = threading.Thread(
+                            target=self.stop_recording_and_transcribe,
+                            daemon=False,
+                        )
+                        t.start()
+                        self._active_thread = t
+        except Exception as e:
+            if not self._shutdown:
+                logger.error(f"Keyboard hook read error: {e}")
+        finally:
+            self._stop_hook()
+
+    def _stop_hook(self):
+        # Send quit signal to the hook process
+        self._send_hook_cmd("QUIT")
+        if self._hook_conn:
             try:
-                root.ungrab_key(keycode, X.AnyModifier)
-                d.sync()
+                self._hook_conn.close()
             except Exception:
                 pass
-            d.close()
-
-    def _handle_event(self, event, keycode):
-        """Process a peeked event that wasn't part of auto-repeat."""
-        if event.type == X.KeyPress and event.detail == keycode:
-            self._on_key_press()
-        elif event.type == X.KeyRelease and event.detail == keycode:
-            self._on_key_release()
-
-    def _on_key_press(self):
-        self.start_recording()
-
-    def _on_key_release(self):
-        t = threading.Thread(
-            target=self.stop_recording_and_transcribe,
-            daemon=False,
-        )
-        t.start()
-        self._active_thread = t
+            self._hook_conn = None
+        if self._server_sock:
+            try:
+                self._server_sock.close()
+            except Exception:
+                pass
+            self._server_sock = None
 
     # ── Main loop ──────────────────────────────────────────────
 
@@ -387,6 +506,7 @@ class WisprDaemon:
         def shutdown(signum, frame):
             logger.info("Shutting down...")
             self._shutdown = True
+            self._stop_hook()
 
         signal.signal(signal.SIGTERM, shutdown)
         signal.signal(signal.SIGINT, shutdown)

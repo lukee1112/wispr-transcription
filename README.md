@@ -1,6 +1,6 @@
 # Wispr Transcription
 
-Local voice dictation tool for Ubuntu / WSL2. Hold a hotkey to record, release to transcribe and paste.
+Local voice dictation tool for WSL2 / Ubuntu. Hold a hotkey to record, release to transcribe and paste.
 
 ## Quick Start
 
@@ -13,14 +13,16 @@ Local voice dictation tool for Ubuntu / WSL2. Hold a hotkey to record, release t
 ## Usage
 
 1. Start the daemon with `./start.sh`
-2. Focus any application (VS Code, browser, terminal, etc.)
+2. Focus any window (browser, VS Code, terminal, etc.)
 3. **Hold Right Alt** to start recording — a red "REC" indicator appears
 4. **Release Right Alt** to stop and transcribe
-5. The transcribed text is pasted into the focused window (via Ctrl+V) and stays on your clipboard
+5. The transcribed text is pasted into the focused window and stays on your clipboard
+
+Works in **all windows** — Windows apps (Chrome, Gmail, Slack) and WSL apps alike.
 
 ## Changing the Hotkey
 
-Edit `config.py` and change the `HOTKEY` line using X11 keysym names:
+Edit `config.py` and change the `HOTKEY` line:
 
 ```python
 HOTKEY = "Alt_R"        # Right Alt (default)
@@ -38,7 +40,7 @@ All settings are in `config.py`:
 
 | Setting | Default | Description |
 |---|---|---|
-| `HOTKEY` | `"Alt_R"` | Hold to record (X11 keysym name) |
+| `HOTKEY` | `"Alt_R"` | Hold to record |
 | `WHISPER_MODEL` | `"medium"` | Model size: tiny, base, small, medium, large |
 | `MIN_RECORDING_SECONDS` | `0.5` | Ignore recordings shorter than this |
 | `MAX_RECORDING_SECONDS` | `300` | Truncate recordings longer than this |
@@ -54,13 +56,13 @@ Log files rotate automatically at 5 MB (3 backups kept).
 ## Troubleshooting
 
 **No audio / microphone not found**
-- Check available devices: `pactl list sources short`
-- In WSL, ensure PulseAudio/PipeWire is working via WSLg
+- Check `PULSE_SERVER` is set: `echo $PULSE_SERVER`
+- Should be `unix:/mnt/wslg/PulseServer` on WSL2
+- Install ALSA PulseAudio plugin: `sudo apt install libasound2-plugins`
 
 **Hotkey not working**
-- Ensure no other app is grabbing Right Alt
-- Check logs for "X11 key grab" messages
-- Verify DISPLAY is set: `echo $DISPLAY`
+- Check logs for "keyboard hook" messages
+- Verify PowerShell works: `powershell.exe -Command "echo test"`
 - Try a different hotkey (see above)
 
 **Transcription is slow**
@@ -69,28 +71,29 @@ Log files rotate automatically at 5 MB (3 backups kept).
 - If you have an NVIDIA GPU, install CUDA drivers for much faster transcription
 
 **Text not pasting**
-- Text is pasted via Ctrl+V — make sure the focused app supports paste
+- Text is pasted via Ctrl+V using Windows clipboard
 - The text is always on your clipboard as a fallback
-- Verify xdotool works: `xdotool key ctrl+v` (with text on clipboard)
 
 ## How It Works
 
-Uses X11 key grabs (`XGrabKey`) for hotkey detection, which works on both native X11 and XWayland (WSLg). Text output uses clipboard + Ctrl+V paste for reliable Unicode support.
+Keyboard capture uses a Windows-side PowerShell script with Win32 `SetWindowsHookEx` — this is the only method that works globally on WSL2/WSLg across all windows (Windows native and WSL GUI apps). Audio recording uses PulseAudio through WSLg. Transcription runs locally via OpenAI Whisper. Text output uses `clip.exe` + PowerShell `SendKeys` for paste.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `wispr.py` | Main daemon (recording, X11 hotkey, text output) |
+| `wispr.py` | Main daemon (recording, text output) |
+| `keyhook.ps1` | Windows keyboard hook (PowerShell + C#) |
 | `config.py` | All configuration |
 | `transcriber.py` | Whisper model + text cleaning |
 | `indicator.py` | Red "REC" overlay window |
 | `install.sh` | One-time installation |
+| `smoke_test.sh` | Post-install verification |
 | `start.sh` / `stop.sh` | Manual start/stop |
 
 ## WSL Notes
 
-- Requires WSLg (Windows 11) for audio, display, and input support
+- Requires WSLg (Windows 11) for audio and display support
 - Audio routes through PulseAudio/PipeWire via WSLg
-- Keyboard capture uses X11 key grabs (works on WSLg's XWayland)
-- Text is pasted via Ctrl+V into WSL GUI apps
+- Keyboard capture runs on the Windows side (PowerShell + Win32 hook)
+- Text paste uses Windows clipboard + SendKeys (works in all apps)

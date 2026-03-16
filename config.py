@@ -3,16 +3,31 @@ import os
 from pathlib import Path
 
 # Hotkey - hold to record, release to transcribe
-# Use X11 keysym names. Common options:
+# Use key names from the list below.
 #   "Alt_R"        Right Alt (default)
 #   "Alt_L"        Left Alt
 #   "Control_R"    Right Control
+#   "Control_L"    Left Control
 #   "Scroll_Lock"  Scroll Lock
 #   "F12"          F12
+#   "F11"          F11
+#   "F10"          F10
 HOTKEY = "Alt_R"
 
+# Windows virtual key codes (used by keyhook.ps1)
+VK_CODES = {
+    "Alt_R": 0xA5,
+    "Alt_L": 0xA4,
+    "Control_R": 0xA3,
+    "Control_L": 0xA2,
+    "Scroll_Lock": 0x91,
+    "F12": 0x7B,
+    "F11": 0x7A,
+    "F10": 0x79,
+}
+
 # Whisper settings
-WHISPER_MODEL = "medium"
+WHISPER_MODEL = "small"
 WHISPER_LANGUAGE = "en"
 
 # Audio settings
