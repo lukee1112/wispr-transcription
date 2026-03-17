@@ -26,6 +26,7 @@ from config import (
     MIN_RECORDING_SECONDS, MAX_RECORDING_SECONDS,
     SILENCE_RMS_THRESHOLD,
     DATA_DIR, LOG_FILE, PID_FILE, INSTALL_DIR,
+    OPENAI_API_KEY,
 )
 from transcriber import Transcriber
 
@@ -286,7 +287,7 @@ class WisprDaemon:
         self._beep(440, 200)   # low beep = paste incoming
         time.sleep(0.3)
 
-        # Paste via keyhook.exe keybd_event (works in all apps including Windows Terminal).
+        # Paste via keyhook.exe SendInput (works in most apps including Windows Terminal).
         # Falls back to PowerShell SendKeys if the hook isn't connected.
         if self._hook_conn:
             self._send_hook_cmd("PASTE")
@@ -492,12 +493,16 @@ class WisprDaemon:
         if not self.check_microphone():
             sys.exit(1)
 
-        self.notify("Loading Whisper model (this may take a moment)...")
+        if not OPENAI_API_KEY:
+            logger.error("OPENAI_API_KEY not set — export it in your shell")
+            self.notify("OPENAI_API_KEY not set", urgency="critical")
+            sys.exit(1)
+
         try:
             self.transcriber.load_model()
         except Exception as e:
-            logger.error(f"Failed to load model: {e}", exc_info=True)
-            self.notify(f"Model load failed: {e}", urgency="critical")
+            logger.error(f"Failed to initialize OpenAI client: {e}", exc_info=True)
+            self.notify(f"OpenAI init failed: {e}", urgency="critical")
             sys.exit(1)
 
         self.notify(f"Ready! Hold {HOTKEY} to dictate.")

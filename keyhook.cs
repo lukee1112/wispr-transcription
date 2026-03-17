@@ -50,6 +50,34 @@ class WisprKeyHook {
     [DllImport("user32.dll")]
     static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
+    // SendInput is the modern replacement for keybd_event. VS Code's terminal ignores
+    // keybd_event but responds to SendInput.
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    const int INPUT_KEYBOARD = 1;
+    const uint KEYEVENTF_KEYUP = 0x0002;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct INPUT {
+        public int type;
+        public INPUTUNION u;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    struct INPUTUNION {
+        [FieldOffset(0)] public KEYBDINPUT ki;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct KEYBDINPUT {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
     static StreamWriter _writer;
     static StreamWriter _log;
     static IntPtr _hookID = IntPtr.Zero;
@@ -110,14 +138,31 @@ class WisprKeyHook {
         return form;
     }
 
-    // Inject Ctrl+V keystrokes globally. Works from a process that has a LL keyboard hook.
-    static void SendCtrlV() {
-        const uint KEYUP = 2;
-        keybd_event(0x11, 0, 0, UIntPtr.Zero);      // VK_CONTROL down
-        keybd_event(0x56, 0, 0, UIntPtr.Zero);      // V down
-        keybd_event(0x56, 0, KEYUP, UIntPtr.Zero);  // V up
-        keybd_event(0x11, 0, KEYUP, UIntPtr.Zero);  // VK_CONTROL up
-        Log("Sent Ctrl+V");
+    static INPUT MakeKey(ushort vk, bool up) {
+        var input = new INPUT { type = INPUT_KEYBOARD };
+        input.u.ki.wVk = vk;
+        input.u.ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+        return input;
+    }
+
+    // Inject Ctrl+V via SendInput (atomic batch), with keybd_event fallback
+    // if UIPI blocks SendInput.
+    static void SendPaste() {
+        var inputs = new INPUT[] {
+            MakeKey(0x11, false),  // VK_CONTROL down
+            MakeKey(0x56, false),  // V down
+            MakeKey(0x56, true),   // V up
+            MakeKey(0x11, true),   // VK_CONTROL up
+        };
+        uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+        if (sent == 0) {
+            Log("SendInput blocked (UIPI), falling back to keybd_event");
+            keybd_event(0x11, 0, 0, UIntPtr.Zero);
+            keybd_event(0x56, 0, 0, UIntPtr.Zero);
+            keybd_event(0x56, 0, 2, UIntPtr.Zero);
+            keybd_event(0x11, 0, 2, UIntPtr.Zero);
+        }
+        Log("Sent Ctrl+V (SendInput=" + sent + "/4)");
     }
 
     static void Cleanup() {
@@ -219,7 +264,7 @@ class WisprKeyHook {
                             _overlay = null;
                         }
                     } else if (cmd == "PASTE") {
-                        SendCtrlV();
+                        SendPaste();
                     }
                 }
                 if (!client.Connected) {

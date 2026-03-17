@@ -1,14 +1,15 @@
-"""Whisper transcription and text cleaning."""
+"""Whisper transcription via OpenAI API and text cleaning."""
+import io
 import re
 import logging
 import threading
 import time
+import wave
 
 import numpy as np
-import whisper
-import torch
+from openai import OpenAI
 
-from config import WHISPER_MODEL, WHISPER_LANGUAGE, FILLER_WORDS, CONTEXT_FILLERS
+from config import OPENAI_API_KEY, WHISPER_LANGUAGE, SAMPLE_RATE, FILLER_WORDS, CONTEXT_FILLERS
 
 logger = logging.getLogger(__name__)
 
@@ -36,42 +37,47 @@ _RE_TRAILING_COMMA = re.compile(r',\s*$')
 
 class Transcriber:
     def __init__(self):
-        self.model = None
-        self.device = None
         self._lock = threading.Lock()
+        self._client = None
 
     def load_model(self):
-        """Load Whisper model, using GPU if available."""
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Loading Whisper '{WHISPER_MODEL}' model on {self.device}...")
-
-        start = time.time()
-        self.model = whisper.load_model(WHISPER_MODEL, device=self.device)
-        elapsed = time.time() - start
-        logger.info(f"Model loaded in {elapsed:.1f}s")
-
-        if self.device == "cuda":
-            gpu_name = torch.cuda.get_device_name(0)
-            logger.info(f"Using GPU: {gpu_name}")
-        else:
-            logger.info("No GPU detected, using CPU (transcription will be slower)")
+        """Validate OpenAI API key and initialize client."""
+        if not OPENAI_API_KEY:
+            raise RuntimeError(
+                "OPENAI_API_KEY not set. Export it in your environment or "
+                "add it to a .env file."
+            )
+        self._client = OpenAI(api_key=OPENAI_API_KEY)
+        # Quick validation — list models would work but is slow.
+        # We'll find out on first transcription if the key is bad.
+        logger.info("OpenAI Whisper API client ready")
 
     def transcribe(self, audio: np.ndarray) -> str:
-        """Transcribe audio numpy array to cleaned text. Thread-safe."""
-        if self.model is None:
-            raise RuntimeError("Model not loaded")
+        """Transcribe audio numpy array to cleaned text via OpenAI API. Thread-safe."""
+        if self._client is None:
+            raise RuntimeError("Client not initialized — call load_model() first")
+
+        # Convert float32 numpy array to WAV bytes for the API
+        wav_buf = io.BytesIO()
+        audio_int16 = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+        with wave.open(wav_buf, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(audio_int16.tobytes())
+        wav_buf.seek(0)
+        wav_buf.name = "audio.wav"  # OpenAI client needs a filename
 
         with self._lock:
             start = time.time()
-            result = self.model.transcribe(
-                audio,
+            response = self._client.audio.transcriptions.create(
+                model="whisper-1",
+                file=wav_buf,
                 language=WHISPER_LANGUAGE,
-                fp16=(self.device == "cuda"),
-                task="transcribe",
             )
             elapsed = time.time() - start
 
-        text = result["text"].strip()
+        text = response.text.strip()
         preview = (text[:80] + "...") if len(text) > 80 else text
         logger.info(f"Transcribed in {elapsed:.1f}s: '{preview}'")
 
